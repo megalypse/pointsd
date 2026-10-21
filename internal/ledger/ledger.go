@@ -30,7 +30,14 @@ type Entry struct {
 // ErrUnavailable is returned when the ledger cannot be reached. Retrying may succeed.
 var ErrUnavailable = errors.New("ledger: unavailable")
 
+// ErrUnknownPayment means there is no award to reverse.
+var ErrUnknownPayment = errors.New("ledger: reversal for unknown payment")
+
 type Store interface {
+	// Award atomically deduplicates the payment, applies the cap and appends the entry.
+	Award(ctx context.Context, e Entry, monthlyCap int64) error
+	// Reverse atomically reverses the stored award at most once.
+	Reverse(ctx context.Context, paymentID string) error
 	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
 	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
 	Append(ctx context.Context, e Entry) error
@@ -116,6 +123,61 @@ func (s *MemoryStore) Append(ctx context.Context, e Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries = append(s.entries, e)
+	return nil
+}
+
+func (s *MemoryStore) Award(ctx context.Context, e Entry, monthlyCap int64) error {
+	if err := s.roundTrip(ctx, "award"); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var used int64
+	for _, entry := range s.entries {
+		if entry.Kind != KindAward {
+			continue
+		}
+		if entry.PaymentID == e.PaymentID {
+			return nil
+		}
+		if entry.MemberID == e.MemberID && entry.Month == e.Month {
+			used += entry.Points
+		}
+	}
+	e.Kind = KindAward
+	e.Points = min(e.Points, max(monthlyCap-used, 0))
+	s.entries = append(s.entries, e)
+	return nil
+}
+
+func (s *MemoryStore) Reverse(ctx context.Context, paymentID string) error {
+	if err := s.roundTrip(ctx, "reverse"); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var award Entry
+	found := false
+	for _, entry := range s.entries {
+		if entry.PaymentID != paymentID {
+			continue
+		}
+		if entry.Kind == KindReversal {
+			return nil
+		}
+		if entry.Kind == KindAward {
+			award = entry
+			found = true
+		}
+	}
+	if !found {
+		return ErrUnknownPayment
+	}
+	award.Kind = KindReversal
+	award.Points = -award.Points
+	s.entries = append(s.entries, award)
 	return nil
 }
 
